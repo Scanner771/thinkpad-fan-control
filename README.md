@@ -21,7 +21,6 @@ thermostat — with a live temp/RPM graph and AC/battery-aware profiles.
 - **Optional telemetry** — push metrics to a Prometheus/VictoriaMetrics endpoint and fire
   ntfy alerts on critical temps. **Off by default; no endpoints preconfigured.**
 
-<img src="docs/architecture.svg" alt="Architecture" width="820">
 
 ## Requirements
 
