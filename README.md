@@ -32,12 +32,18 @@ thermostat — with a live temp/RPM graph and AC/battery-aware profiles.
 
 ## Compatibility
 
-Tested on **ThinkPad P1 Gen 3 (i9-10885H)** and **P1 Gen 4**. Everything it drives —
-`thinkpad_acpi` fan control, Intel RAPL power limits, `platform_profile`, and `BAT0`
-charge thresholds — is common across recent ThinkPads, and per-chassis details (fan
-count, hwmon indices, PL ceilings) are auto-detected; missing sensors are handled
-gracefully. **Other models (incl. P1 Gen 2) very likely work but are unverified** —
-reports welcome. Nothing here is model-hardcoded.
+Tested with **app version 2.1** on:
+
+| ThinkPad model | CPU generation | Kernel |
+|---|---|---|
+| P1 Gen 3 | Intel 10th-gen (Comet Lake-H) | Linux 6.x |
+| P1 Gen 4 | Intel 11th-gen (Tiger Lake-H) | Linux 6.x |
+
+Everything it drives — `thinkpad_acpi` fan control, Intel RAPL power limits,
+`platform_profile`, and `BAT0` charge thresholds — is common across recent ThinkPads,
+and per-chassis details (fan count, hwmon indices, PL ceilings) are auto-detected;
+missing sensors are handled gracefully. **Other models (incl. P1 Gen 2) very likely
+work but are unverified** — reports welcome. Nothing here is model-hardcoded.
 
 ## Install
 
