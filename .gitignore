@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.bak-*
+audit.log
+config.json
+*.csv

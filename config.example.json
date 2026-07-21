@@ -1,0 +1,41 @@
+{
+  "mode": "curve",
+  "curves": {
+    "ac": [
+      { "temp": 0,  "level": "1" },
+      { "temp": 45, "level": "2" },
+      { "temp": 55, "level": "3" },
+      { "temp": 65, "level": "4" },
+      { "temp": 75, "level": "5" },
+      { "temp": 85, "level": "7" },
+      { "temp": 90, "level": "full-speed" }
+    ],
+    "battery": [
+      { "temp": 0,  "level": "1" },
+      { "temp": 45, "level": "2" },
+      { "temp": 55, "level": "3" },
+      { "temp": 65, "level": "4" },
+      { "temp": 75, "level": "5" },
+      { "temp": 85, "level": "7" },
+      { "temp": 90, "level": "full-speed" }
+    ]
+  },
+  "hysteresis": 5,
+  "power_auto": false,
+  "auto_profile": false,
+  "preset": "Balanced",
+  "target_temp": 80,
+  "power_adapt": false,
+  "power_ac_preset": "Performance",
+  "power_batt_preset": "Balanced",
+  "desktop_notify": true,
+  "telemetry": {
+    "enabled": false,
+    "vm_url": "",
+    "ntfy_url": "",
+    "ntfy_topic": "",
+    "push_interval": 15,
+    "alert_temp": 92,
+    "alert_sustain": 30
+  }
+}

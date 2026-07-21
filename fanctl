@@ -1,0 +1,63 @@
+#!/bin/bash
+# fanctl - privileged ThinkPad helper for fan-control.py.
+# Multi-command: fan level, battery charge threshold, CPU RAPL power limits.
+# Installed to /usr/local/bin/fanctl and invoked via NOPASSWD sudo.
+# Backward compatible: `fanctl <level>` still works as before.
+set -euo pipefail
+
+FAN=/proc/acpi/ibm/fan
+BAT=/sys/class/power_supply/BAT0
+RAPL=/sys/class/powercap/intel-rapl:0
+
+cmd="${1:-}"
+arg="${2:-}"
+
+is_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+_fan_ready() {
+    if [ "$(cat /sys/module/thinkpad_acpi/parameters/fan_control 2>/dev/null)" != "Y" ]; then
+        echo "fan_control disabled (reload thinkpad_acpi with fan_control=1)" >&2
+        exit 3
+    fi
+}
+
+_set_level() {
+    case "$1" in
+        auto|full-speed|disengaged|0|1|2|3|4|5|6|7) ;;
+        *) echo "invalid level: '$1'" >&2; exit 2 ;;
+    esac
+    _fan_ready
+    echo "level $1" > "$FAN"
+}
+
+case "$cmd" in
+    # --- fan level: bare form `fanctl <level>` (backward compatible) ---
+    auto|full-speed|disengaged|0|1|2|3|4|5|6|7)
+        _set_level "$cmd" ;;
+    # --- explicit `fanctl level <lvl>` ---
+    level)
+        _set_level "$arg" ;;
+    # --- battery charge stop threshold (%) — longevity cap ---
+    charge-stop)
+        is_int "$arg" && [ "$arg" -ge 50 ] && [ "$arg" -le 100 ] \
+            || { echo "charge-stop needs an integer 50-100" >&2; exit 2; }
+        echo "$arg" > "$BAT/charge_control_end_threshold" ;;
+    # --- battery charge start threshold (%) ---
+    charge-start)
+        is_int "$arg" && [ "$arg" -ge 0 ] && [ "$arg" -le 99 ] \
+            || { echo "charge-start needs an integer 0-99" >&2; exit 2; }
+        echo "$arg" > "$BAT/charge_control_start_threshold" ;;
+    # --- CPU sustained power limit PL1 (watts) ---
+    pl1)
+        is_int "$arg" && [ "$arg" -ge 15 ] && [ "$arg" -le 125 ] \
+            || { echo "pl1 needs an integer 15-125 (watts)" >&2; exit 2; }
+        echo $((arg * 1000000)) > "$RAPL/constraint_0_power_limit_uw" ;;
+    # --- CPU burst power limit PL2 (watts) ---
+    pl2)
+        is_int "$arg" && [ "$arg" -ge 15 ] && [ "$arg" -le 135 ] \
+            || { echo "pl2 needs an integer 15-135 (watts)" >&2; exit 2; }
+        echo $((arg * 1000000)) > "$RAPL/constraint_1_power_limit_uw" ;;
+    *)
+        echo "usage: fanctl {<level>|level L|charge-stop N|charge-start N|pl1 W|pl2 W}" >&2
+        exit 2 ;;
+esac

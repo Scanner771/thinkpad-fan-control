@@ -1,0 +1,16 @@
+# User service: ~/.config/systemd/user/fan-control.service
+# Enable with:  systemctl --user enable --now fan-control.service
+[Unit]
+Description=ThinkPad Fan Control
+After=graphical-session.target
+
+[Service]
+Type=simple
+# Resolve the running X/Wayland session cookie so the tray icon appears.
+Environment=XAUTHORITY=%h/.Xauthority
+ExecStart=/usr/bin/python3 %h/fan-control.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
