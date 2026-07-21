@@ -7,6 +7,15 @@ thermostat — with a live temp/RPM graph and AC/battery-aware profiles.
 
 ![ThinkPad Fan Control — Fan tab](docs/screenshot.png)
 
+<details>
+<summary>More screenshots — Sensors, Battery, Power</summary>
+
+![Sensors](docs/tab-sensors.png)
+![Battery](docs/tab-battery.png)
+![Power](docs/tab-power.png)
+
+</details>
+
 ## Features
 
 - **Three modes** — Manual (pin a fixed level), Curve (temp → level with hysteresis,
@@ -47,7 +56,8 @@ work but are unverified** — reports welcome. Nothing here is model-hardcoded.
 ## Install
 
 ```
-git clone <this-repo> && cd thinkpad-fan-control
+git clone https://github.com/Scanner771/thinkpad-fan-control && cd thinkpad-fan-control
+pip install -r requirements.txt
 sudo bash setup-fan-control.sh
 python3 fan-control.py
 ```
