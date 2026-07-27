@@ -22,11 +22,12 @@ import time
 import urllib.request
 from collections import deque
 
-from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap
+from PyQt6.QtCore import QPoint, QRect, QSize, QTimer, Qt
+from PyQt6.QtGui import (QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPen,
+                         QPixmap, QShortcut)
 from PyQt6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
+    QFileDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLayout,
     QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QRadioButton,
     QScrollArea, QSizePolicy, QSpinBox, QSystemTrayIcon, QTableWidget,
     QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
@@ -58,7 +59,7 @@ QLabel { background: transparent; }
 QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; border: none; }
 QGroupBox {
     background: #1c1f26; border: 1px solid #2a2e37; border-radius: 12px;
-    margin-top: 16px; padding: 16px 14px 12px 14px; font-weight: 600;
+    margin-top: 16px; padding: 14px 12px 10px 12px; font-weight: 600;
 }
 QGroupBox::title {
     subcontrol-origin: margin; subcontrol-position: top left;
@@ -66,15 +67,24 @@ QGroupBox::title {
     text-transform: uppercase; font-size: 11px; letter-spacing: 1px;
 }
 QTabWidget::pane {
-    border: 1px solid #2a2e37; border-radius: 12px; top: -1px; background: #1c1f26;
+    border: 1px solid #2a2e37; border-radius: 12px; background: #1c1f26; top: 4px;
 }
+QTabWidget::tab-bar { alignment: center; }
+/* Pill tabs: each one reads as a real button, the active one is filled. */
+QTabBar { qproperty-drawBase: 0; background: transparent; }
 QTabBar::tab {
-    background: transparent; color: #9aa1ab; padding: 8px 22px;
-    margin-right: 2px; border: none; border-bottom: 2px solid transparent;
-    font-weight: 500;
+    background: #20242c; color: #9aa1ab; padding: 7px 12px; margin: 0 3px 0 0;
+    border: 1px solid #2f3540; border-radius: 9px; font-weight: 600; min-height: 17px;
 }
-QTabBar::tab:selected { color: #ffffff; border-bottom: 2px solid %(accent)s; }
-QTabBar::tab:hover:!selected { color: #cfd3da; }
+QTabBar QToolButton { background: #1c1f26; border: 1px solid #333945; border-radius: 6px; }
+QTabBar::tab:selected {
+    color: #ffffff; background: #33262a;
+    border: 1px solid %(accent)s; border-bottom: 2px solid %(accent)s;
+}
+QTabBar::tab:hover:!selected {
+    color: #e6e8eb; background: #2a2f38; border-color: #414957;
+}
+QTabBar::tab:!selected { margin-top: 2px; }   /* unselected sit slightly lower */
 QPushButton {
     background: #262b34; color: #e6e8eb; border: 1px solid #333945;
     border-radius: 8px; padding: 8px 14px;
@@ -129,10 +139,14 @@ QHeaderView::section {
     background: #1c1f26; color: #9aa1ab; border: none; padding: 6px; font-weight: 600;
 }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
 QScrollBar::handle:vertical {
     background: #333945; border-radius: 5px; min-height: 30px;
 }
-QScrollBar::handle:vertical:hover { background: #454d5a; }
+QScrollBar::handle:horizontal {
+    background: #333945; border-radius: 5px; min-width: 30px;
+}
+QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover { background: #454d5a; }
 QScrollBar::add-line, QScrollBar::sub-line { height: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
 """ % {"accent": ACCENT}
@@ -143,7 +157,12 @@ READOUT_CSS = ("background: #0f1114; border: 1px solid #2a2e37; "
 
 CURVE_LEVELS = ["0", "1", "2", "3", "4", "5", "6", "7", "full-speed"]
 CRITICAL_TEMP = 90
-REASSERT_TICKS = 60       # re-assert held level every N s (defeats EC watchdog)
+
+# Below this the window drops the title block and shrinks the graphs.
+COMPACT_W = 420
+COMPACT_H = 560
+REASSERT_TICKS = 60       # EC state unreadable: blind re-assert every N s (defeats EC watchdog)
+REASSERT_DRIFT_TICKS = 5  # EC drifted off the held level: re-write, then wait N s before retrying
 TARGET_INTERVAL = 3       # seconds between target-mode adjustments
 DEFAULT_TARGET = 80       # °C for target mode
 DEFAULT_HYSTERESIS = 5
@@ -264,6 +283,7 @@ def load_config() -> dict:
         "telemetry": dict(DEFAULT_TELEMETRY),
         "desktop_notify": True,
         "geometry": None,
+        "tab": 0,
         "power_adapt": False,
         "power_ac_preset": "Performance",
         "power_batt_preset": "Balanced",
@@ -298,8 +318,11 @@ def load_config() -> dict:
         cfg["telemetry"].update(saved["telemetry"])
     cfg["desktop_notify"] = bool(saved.get("desktop_notify", True))
     geo = saved.get("geometry")
-    if isinstance(geo, list) and len(geo) == 2 and all(isinstance(n, int) for n in geo):
+    # v1 stored [w, h]; v2 stores [x, y, w, h]. Accept both.
+    if isinstance(geo, list) and len(geo) in (2, 4) and all(isinstance(n, int) for n in geo):
         cfg["geometry"] = geo
+    if isinstance(saved.get("tab"), int) and 0 <= saved["tab"] < 16:
+        cfg["tab"] = saved["tab"]
     cfg["power_adapt"] = bool(saved.get("power_adapt", False))
     if saved.get("power_ac_preset") in PL_PRESETS:
         cfg["power_ac_preset"] = saved["power_ac_preset"]
@@ -713,6 +736,128 @@ def send_ntfy(tel: dict, title: str, message: str, priority: str = "urgent", tag
 # --------------------------------------------------------------------------- #
 # Live graph
 # --------------------------------------------------------------------------- #
+class FlowLayout(QLayout):
+    """Row layout that wraps onto the next line instead of overflowing.
+
+    Button/radio rows used to be plain QHBoxLayouts, so a narrow window either
+    clipped them or forced the whole tab wider than the viewport. This wraps.
+    """
+
+    def __init__(self, parent=None, margin=0, spacing=6):
+        super().__init__(parent)
+        self.setContentsMargins(margin, margin, margin, margin)
+        self.setSpacing(spacing)
+        self._items = []
+
+    def addItem(self, item):          # noqa: N802  (Qt API)
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):              # noqa: N802
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):              # noqa: N802
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):    # noqa: N802
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):      # noqa: N802
+        return True
+
+    def heightForWidth(self, width):  # noqa: N802
+        return self._do(QRect(0, 0, width, 0), test=True)
+
+    def setGeometry(self, rect):      # noqa: N802
+        super().setGeometry(rect)
+        self._do(rect, test=False)
+
+    def sizeHint(self):               # noqa: N802
+        return self.minimumSize()
+
+    def minimumSize(self):            # noqa: N802
+        s = QSize()
+        for it in self._items:
+            s = s.expandedTo(it.minimumSize())
+        m = self.contentsMargins()
+        return s + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _do(self, rect, test):
+        m = self.contentsMargins()
+        eff = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        x, y, line_h = eff.x(), eff.y(), 0
+        sp = self.spacing()
+        line = []                      # items on the current line, placed once its height is known
+
+        def flush():
+            if test:
+                return
+            for it2, ix, iw, ih in line:
+                it2.setGeometry(QRect(QPoint(ix, y + (line_h - ih) // 2), QSize(iw, ih)))
+
+        for it in self._items:
+            hint = it.sizeHint()
+            w = min(hint.width(), max(eff.width(), 1))     # never wider than the row
+            if x + w > eff.right() + 1 and line:
+                flush()
+                x, y, line_h, line = eff.x(), y + line_h + sp, 0, []
+            line.append((it, x, w, hint.height()))
+            x += w + sp
+            line_h = max(line_h, hint.height())
+        flush()
+        return y + line_h - rect.y() + m.bottom()
+
+
+def flow(*widgets, spacing=6):
+    """Build a wrapping row from widgets."""
+    fl = FlowLayout(spacing=spacing)
+    for w in widgets:
+        fl.addWidget(w)
+    return fl
+
+
+def shrinkable(label: QLabel, wrap: bool = True) -> QLabel:
+    """Let a readout label wrap and shrink instead of pinning the window wide.
+
+    A non-wrapping QLabel reports its full text width as its *minimum* width, so
+    one long status line (e.g. the services list) dragged every tab wider than
+    the screen and clipped the controls on the right.
+    """
+    label.setWordWrap(wrap)
+    label.setMinimumWidth(0)
+    label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum)
+    return label
+
+
+def field(widget, minimum: int = 72, maximum: int = 420):
+    """Stop combos/spins ballooning across a wide window while still shrinking."""
+    widget.setMinimumWidth(minimum)
+    widget.setMaximumWidth(maximum)
+    widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+    if isinstance(widget, QComboBox):
+        widget.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        widget.setMinimumContentsLength(8)
+    return widget
+
+
+def form_row(text: str, *widgets, label_width: int = 78, stretch_first: bool = True):
+    """label + controls on one line, with a consistent label column."""
+    row = QHBoxLayout()
+    row.setSpacing(8)
+    lbl = QLabel(text)
+    lbl.setMinimumWidth(label_width)
+    lbl.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+    row.addWidget(lbl)
+    for i, w in enumerate(widgets):
+        row.addWidget(w, 1 if (stretch_first and i == 0) else 0)
+    # Absorb whatever is left once the controls hit their maximum width, so a wide
+    # window doesn't scatter them across the row.
+    row.addStretch(0)
+    return row
+
+
 class Sparkline(QWidget):
     SPAN = 120
 
@@ -1013,7 +1158,8 @@ class FanControl(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Fan Control")
-        self.setMinimumSize(360, 420)
+        # Narrowest width every tab still fits without a horizontal scrollbar.
+        self.setMinimumSize(360, 380)
 
         cfg = load_config()
         self.curves = cfg["curves"]
@@ -1043,6 +1189,7 @@ class FanControl(QMainWindow):
         self._stats = {"cpu_max": 0, "cpu_min": 999, "rpm_max": 0, "secs": 0,
                        "level_secs": {}}
         self._geometry = cfg.get("geometry")
+        self._start_tab = cfg.get("tab", 0)
         self.power_adapt = cfg["power_adapt"]
         self.power_ac_preset = cfg["power_ac_preset"]
         self.power_batt_preset = cfg["power_batt_preset"]
@@ -1061,20 +1208,25 @@ class FanControl(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setSpacing(8)
-        root.setContentsMargins(12, 12, 12, 12)
+        root.setContentsMargins(10, 10, 10, 10)
 
-        header = QLabel("ThinkPad Fan Control")
+        self._compact = None
+        header = self._header = QLabel("ThinkPad Fan Control")
         header.setFont(QFont("sans-serif", 15, QFont.Weight.Bold))
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         header.setStyleSheet("color: #ffffff; letter-spacing: 0.5px;")
         root.addWidget(header)
-        subtitle = QLabel(f"{os.uname().nodename} · v{VERSION}")
+        subtitle = self._subtitle = QLabel(f"{os.uname().nodename} · v{VERSION}")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         subtitle.setStyleSheet(f"color: {ACCENT}; font-size: 10px;")
         root.addWidget(subtitle)
 
         self.tabs = QTabWidget()
-        root.addWidget(self.tabs)
+        self.tabs.setUsesScrollButtons(True)          # narrow window: scroll the tab bar…
+        self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideRight)   # …rather than clip it
+        self.tabs.tabBar().setExpanding(False)
+        self.tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        root.addWidget(self.tabs, 1)
 
         # ===================== Fan tab (existing UI) ===================== #
         fan_tab = QWidget()
@@ -1089,6 +1241,7 @@ class FanControl(QMainWindow):
         mon_layout.setSpacing(6)
         grid = QGridLayout()
         grid.setSpacing(4)
+        grid.setColumnStretch(1, 1)
         fan2_label = "Fan 2 (GPU)" if self.has_dgpu else "Fan 2 (System)"
         for row, (text, attr) in enumerate([("Fan 1 (CPU)", "bar1"), (fan2_label, "bar2")]):
             lbl = QLabel(text)
@@ -1106,6 +1259,7 @@ class FanControl(QMainWindow):
         self.temp_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.temp_label.setFont(QFont("monospace", 11))
         self.temp_label.setTextFormat(Qt.TextFormat.RichText)
+        shrinkable(self.temp_label)
         mon_layout.addWidget(self.temp_label)
 
         self.graph = Sparkline()
@@ -1114,6 +1268,7 @@ class FanControl(QMainWindow):
         self.level_label = QLabel("Level: --")
         self.level_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.level_label.setFont(QFont("monospace", 10))
+        shrinkable(self.level_label)
         mon_layout.addWidget(self.level_label)
         layout.addWidget(mon_group)
 
@@ -1125,15 +1280,14 @@ class FanControl(QMainWindow):
         self.group = QButtonGroup(self)
         levels = [("Auto", "auto"), ("Low (2)", "2"), ("Medium (4)", "4"),
                   ("High (6)", "6"), ("Max (7)", "7"), ("Full Speed", "full-speed")]
-        row1, row2 = QHBoxLayout(), QHBoxLayout()
-        for i, (label, value) in enumerate(levels):
+        level_row = FlowLayout(spacing=10)
+        for label, value in levels:
             rb = QRadioButton(label)
             rb.setProperty("fan_level", value)
             rb.toggled.connect(self._on_level_changed)
             self.group.addButton(rb)
-            (row1 if i < 3 else row2).addWidget(rb)
-        ctrl_layout.addLayout(row1)
-        ctrl_layout.addLayout(row2)
+            level_row.addWidget(rb)
+        ctrl_layout.addLayout(level_row)
 
         # Smart Curve + preset selector + editor
         curve_row = QHBoxLayout()
@@ -1146,10 +1300,11 @@ class FanControl(QMainWindow):
         self.preset_combo.addItems(PRESET_NAMES)
         self.preset_combo.setCurrentText(self.preset_name)
         self.preset_combo.currentTextChanged.connect(self._on_preset_changed)
-        curve_row.addWidget(self.preset_combo, 1)
+        curve_row.addWidget(field(self.preset_combo), 1)
         edit_btn = QPushButton("Edit…")
         edit_btn.clicked.connect(self._edit_curve)
         curve_row.addWidget(edit_btn)
+        curve_row.addStretch(0)
         ctrl_layout.addLayout(curve_row)
 
         # Target temperature (thermostat) mode
@@ -1168,7 +1323,7 @@ class FanControl(QMainWindow):
         target_row.addStretch()
         ctrl_layout.addLayout(target_row)
 
-        self.auto_cb = QCheckBox("Auto-profile (switch preset by workload)")
+        self.auto_cb = QCheckBox("Auto-profile by workload")
         self.auto_cb.setToolTip("Detects games / compiles / idle and switches the curve preset automatically.")
         self.auto_cb.setChecked(self.auto_profile)
         self.auto_cb.toggled.connect(self._on_auto_profile)
@@ -1186,7 +1341,7 @@ class FanControl(QMainWindow):
         self.autostart_cb.toggled.connect(self._on_autostart)
         ctrl_layout.addWidget(self.autostart_cb)
 
-        self.notify_cb = QCheckBox("Desktop notification on thermal alerts")
+        self.notify_cb = QCheckBox("Notify on thermal alerts")
         self.notify_cb.setToolTip("Pop a native notification when the CPU reaches a critical temperature.")
         self.notify_cb.setChecked(self.desktop_notify)
         self.notify_cb.toggled.connect(self._on_notify)
@@ -1197,6 +1352,7 @@ class FanControl(QMainWindow):
         self.info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.info_label.setFont(QFont("sans-serif", 8))
         self.info_label.setStyleSheet("color: #888;")
+        shrinkable(self.info_label)
         layout.addWidget(self.info_label)
         layout.addStretch()
 
@@ -1221,16 +1377,80 @@ class FanControl(QMainWindow):
         elif self.mode == "target":
             self.target_rb.setChecked(True)
 
-        if self._geometry:
-            self.resize(self._geometry[0], self._geometry[1])
-        else:
-            self.resize(400, 820)
+        self._restore_geometry()
+        if 0 <= self._start_tab < self.tabs.count():
+            self.tabs.setCurrentIndex(self._start_tab)
+        self._install_shortcuts()
 
         self.timer = QTimer()
         self.timer.timeout.connect(self._refresh)
         self.timer.start(1000)
         self._refresh()
         QTimer.singleShot(0, self._check_setup)
+
+    # ---- window geometry / shortcuts ----
+    def _restore_geometry(self):
+        """Reopen where it was closed, unless that screen is gone (dock unplugged)."""
+        geo = self._geometry
+        if not geo:
+            self.resize(400, 820)
+            return
+        x, y, w, h = (geo if len(geo) == 4 else [None, None, geo[0], geo[1]])
+        self.resize(w, h)
+        if x is None:
+            return
+        for scr in QApplication.screens():
+            a = scr.availableGeometry()
+            # top-left inside a live screen, with 80px of the title bar reachable
+            if a.contains(QPoint(x + 80, y + 10)):
+                self.move(x, y)
+                return
+
+    def _install_shortcuts(self):
+        binds = [(f"Ctrl+{i + 1}", lambda i=i: self.tabs.setCurrentIndex(i))
+                 for i in range(self.tabs.count())]
+        binds += [
+            ("Ctrl+R", self._force_refresh), ("F5", self._force_refresh),
+            ("Ctrl+W", self._hide_or_close), ("Esc", self._hide_or_close),
+            ("Ctrl+Q", QApplication.quit),
+            ("Ctrl+Tab", lambda: self.tabs.setCurrentIndex(
+                (self.tabs.currentIndex() + 1) % self.tabs.count())),
+            ("Ctrl+Shift+Tab", lambda: self.tabs.setCurrentIndex(
+                (self.tabs.currentIndex() - 1) % self.tabs.count())),
+        ]
+        self._shortcuts = []
+        for keys, slot in binds:
+            sc = QShortcut(QKeySequence(keys), self)
+            sc.activated.connect(slot)
+            self._shortcuts.append(sc)
+
+    def _force_refresh(self):
+        self._refresh()
+        self._refresh_aux()
+
+    def _hide_or_close(self):
+        self._save()
+        self.hide() if self.tray and self.tray.isVisible() else self.close()
+
+    # ---- compact mode (small window: drop the chrome, keep the controls) ----
+    def _apply_compact(self, compact: bool):
+        if getattr(self, "_compact", None) == compact:
+            return
+        self._compact = compact
+        self._header.setVisible(not compact)
+        self._subtitle.setVisible(not compact)
+        m = 4 if compact else 10
+        self.centralWidget().layout().setContentsMargins(m, m, m, m)
+        self.tabs.tabBar().setStyleSheet(
+            "QTabBar::tab { padding: 5px 8px; margin: 0 2px 0 0; }"
+            if compact else "")
+        if getattr(self, "graph", None) is not None:
+            self.graph.setMinimumHeight(56 if compact else 90)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "_header") and self.centralWidget():
+            self._apply_compact(self.width() < COMPACT_W or self.height() < COMPACT_H)
 
     # ---- config ----
     def _cfg(self) -> dict:
@@ -1240,7 +1460,8 @@ class FanControl(QMainWindow):
             "preset": self.preset_name, "target_temp": self.target_temp,
             "telemetry": self.telemetry,
             "desktop_notify": self.desktop_notify,
-            "geometry": [self.width(), self.height()],
+            "geometry": [self.x(), self.y(), self.width(), self.height()],
+            "tab": self.tabs.currentIndex() if hasattr(self, "tabs") else 0,
             "power_adapt": self.power_adapt,
             "power_ac_preset": self.power_ac_preset,
             "power_batt_preset": self.power_batt_preset,
@@ -1400,7 +1621,7 @@ class FanControl(QMainWindow):
         else:
             self.mode = "manual"
             self._desired_level = value
-            self._reassert = REASSERT_TICKS
+            self._reassert = REASSERT_DRIFT_TICKS
             self._write_level(value)
         self._save()
         self._refresh()
@@ -1570,7 +1791,7 @@ class FanControl(QMainWindow):
             self._apply_curve(temps)
         elif self.mode == "target":
             self._apply_target(temps)
-        self._reassert_held()
+        self._reassert_held(level)
 
         # status line
         if self._error:
@@ -1689,15 +1910,40 @@ class FanControl(QMainWindow):
         self._desired_level = target
         if target != self._applied_level:
             self._write_level(target)
-            self._reassert = REASSERT_TICKS
+            # suppress an instant duplicate: _refresh read the EC level BEFORE
+            # this write, so it still shows the old level on this tick.
+            self._reassert = REASSERT_DRIFT_TICKS
 
-    def _reassert_held(self):
+    def _reassert_held(self, ec_level=None):
+        """Keep the EC on the level we hold, but only WRITE when it has drifted.
+
+        This used to fire an unconditional `sudo fanctl <level>` every
+        REASSERT_TICKS seconds whether or not the EC had moved — all no-ops,
+        which made a single process look like two writers fighting. The EC level
+        is already read once per tick by _refresh, so compare and stay quiet.
+        """
         if not self._desired_level or self._desired_level == "auto":
             return
-        self._reassert -= 1
-        if self._reassert <= 0:
-            self._reassert = REASSERT_TICKS
-            self._write_level(self._desired_level)
+
+        if ec_level in (None, "unknown"):
+            # Can't read EC state — fall back to the old blind periodic write.
+            self._reassert -= 1
+            if self._reassert <= 0:
+                self._reassert = REASSERT_TICKS
+                self._write_level(self._desired_level)
+            return
+
+        if ec_level == self._desired_level:
+            self._reassert = 0          # in sync: nothing to write
+            return
+
+        # Drifted (EC watchdog reset, or something else wrote the fan).
+        # Correct it now, then hold off so a rejected write can't storm sudo.
+        if self._reassert > 0:
+            self._reassert -= 1
+            return
+        self._reassert = REASSERT_DRIFT_TICKS
+        self._write_level(self._desired_level)
 
     def _telemetry(self, temps, info, level, maxt):
         tel = self.telemetry
@@ -1718,12 +1964,28 @@ class FanControl(QMainWindow):
             self._alerted = False
 
     # ---- tab scrolling (content scrolls instead of clipping when window is small) ----
+    # Widest a tab's content column gets; past this it centres instead of
+    # stretching progress bars and sliders across the whole monitor.
+    MAX_CONTENT_W = 900
+
     def _scrollable(self, inner):
+        inner.setMaximumWidth(self.MAX_CONTENT_W)
+        holder = QWidget()
+        hb = QHBoxLayout(holder)
+        hb.setContentsMargins(0, 0, 0, 0)
+        hb.addStretch(1)
+        hb.addWidget(inner, 10)
+        hb.addStretch(1)
+
         sa = QScrollArea()
         sa.setWidgetResizable(True)
         sa.setFrameShape(QFrame.Shape.NoFrame)
-        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        sa.setWidget(inner)
+        # As-needed, not always-off: if something *does* exceed the width it can
+        # still be reached instead of being silently clipped off the right edge.
+        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        sa.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        sa.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        sa.setWidget(holder)
         return sa
 
     # ---- Sensors tab ----
@@ -1741,6 +2003,7 @@ class FanControl(QMainWindow):
         self.sensors_label.setTextFormat(Qt.TextFormat.RichText)
         self.sensors_label.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.sensors_label.setStyleSheet(READOUT_CSS)
+        shrinkable(self.sensors_label)
         v.addWidget(self.sensors_label)
 
         stats_box = QGroupBox("Session stats")
@@ -1748,17 +2011,14 @@ class FanControl(QMainWindow):
         self.stats_label = QLabel("…")
         self.stats_label.setFont(QFont("monospace", 9))
         self.stats_label.setTextFormat(Qt.TextFormat.RichText)
+        shrinkable(self.stats_label)
         sv.addWidget(self.stats_label)
-        reset_row = QHBoxLayout()
         reset_btn = QPushButton("Reset stats")
         reset_btn.clicked.connect(self._reset_stats)
-        reset_row.addWidget(reset_btn)
         export_btn = QPushButton("Export CSV…")
         export_btn.setToolTip("Save the recorded temp / RPM / power history to a CSV file.")
         export_btn.clicked.connect(self._export_csv)
-        reset_row.addWidget(export_btn)
-        reset_row.addStretch()
-        sv.addLayout(reset_row)
+        sv.addLayout(flow(reset_btn, export_btn))
         v.addWidget(stats_box)
         v.addStretch()
         return w
@@ -1813,6 +2073,7 @@ class FanControl(QMainWindow):
         self.bat_info.setFont(QFont("monospace", 10))
         self.bat_info.setTextFormat(Qt.TextFormat.RichText)
         self.bat_info.setStyleSheet(READOUT_CSS)
+        shrinkable(self.bat_info)
         v.addWidget(self.bat_info)
 
         box = QGroupBox("Charge limit (battery longevity)")
@@ -1825,27 +2086,24 @@ class FanControl(QMainWindow):
         note.setStyleSheet("color:#888;")
         bl.addWidget(note)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("Stop charging at:"))
         self.charge_spin = QSpinBox()
         self.charge_spin.setRange(50, 100)
         self.charge_spin.setSuffix(" %")
         self.charge_spin.setValue(read_battery().get("stop") or 100)
-        row.addWidget(self.charge_spin)
         apply_btn = QPushButton("Apply")
         apply_btn.clicked.connect(lambda: self._apply_charge())
-        row.addWidget(apply_btn)
-        row.addStretch()
-        bl.addLayout(row)
+        stop_lbl = QLabel("Stop charging at")
+        stop_lbl.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        bl.addLayout(flow(stop_lbl, field(self.charge_spin, 90, 130), apply_btn))
 
-        qp = QHBoxLayout()
-        qp.addWidget(QLabel("Quick:"))
+        quick_lbl = QLabel("Quick")
+        quick_lbl.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        quick = [quick_lbl]
         for pct in (60, 80, 100):
             b = QPushButton(f"{pct}%")
             b.clicked.connect(lambda _c, p=pct: self._apply_charge(p))
-            qp.addWidget(b)
-        qp.addStretch()
-        bl.addLayout(qp)
+            quick.append(b)
+        bl.addLayout(flow(*quick))
         v.addWidget(box)
         v.addStretch()
         return w
@@ -1888,11 +2146,11 @@ class FanControl(QMainWindow):
         self.power_info.setFont(QFont("monospace", 10))
         self.power_info.setTextFormat(Qt.TextFormat.RichText)
         self.power_info.setStyleSheet(READOUT_CSS)
+        shrinkable(self.power_info)
         v.addWidget(self.power_info)
 
         ppd_box = QGroupBox("Power profile")
-        pl = QHBoxLayout(ppd_box)
-        pl.addWidget(QLabel("Profile:"))
+        pl = QVBoxLayout(ppd_box)
         self.ppd_combo = QComboBox()
         profs = list_ppd() or ["power-saver", "balanced", "performance"]
         self.ppd_combo.addItems(profs)
@@ -1900,8 +2158,7 @@ class FanControl(QMainWindow):
         if cur in profs:
             self.ppd_combo.setCurrentText(cur)
         self.ppd_combo.currentTextChanged.connect(self._apply_ppd)
-        pl.addWidget(self.ppd_combo)
-        pl.addStretch()
+        pl.addLayout(form_row("Profile", field(self.ppd_combo)))
         v.addWidget(ppd_box)
 
         rapl_box = QGroupBox("CPU power limits")
@@ -1915,18 +2172,19 @@ class FanControl(QMainWindow):
         note.setStyleSheet("color:#888;")
         rl.addWidget(note, 0, 0, 1, 3)
         cp = read_cpu_power()
+        rl.setColumnStretch(1, 1)
         rl.addWidget(QLabel("PL1 sustained:"), 1, 0)
         self.pl1_spin = QSpinBox()
         self.pl1_spin.setRange(15, 125)
         self.pl1_spin.setSuffix(" W")
         self.pl1_spin.setValue(cp["pl1"] or 45)
-        rl.addWidget(self.pl1_spin, 1, 1)
+        rl.addWidget(field(self.pl1_spin, 90, 160), 1, 1)
         rl.addWidget(QLabel("PL2 burst:"), 2, 0)
         self.pl2_spin = QSpinBox()
         self.pl2_spin.setRange(15, 135)
         self.pl2_spin.setSuffix(" W")
         self.pl2_spin.setValue(cp["pl2"] or 65)
-        rl.addWidget(self.pl2_spin, 2, 1)
+        rl.addWidget(field(self.pl2_spin, 90, 160), 2, 1)
         apply_btn = QPushButton("Apply")
         apply_btn.clicked.connect(lambda: self._apply_rapl())
         rl.addWidget(apply_btn, 1, 2, 2, 1)
@@ -1949,18 +2207,19 @@ class FanControl(QMainWindow):
         self.power_adapt_cb.setChecked(self.power_adapt)
         self.power_adapt_cb.toggled.connect(self._on_power_adapt)
         ab.addWidget(self.power_adapt_cb, 0, 0, 1, 2)
+        ab.setColumnStretch(1, 1)
         ab.addWidget(QLabel("On AC:"), 1, 0)
         self.ac_preset_combo = QComboBox()
         self.ac_preset_combo.addItems(PL_PRESET_ORDER)
         self.ac_preset_combo.setCurrentText(self.power_ac_preset)
         self.ac_preset_combo.currentTextChanged.connect(self._on_power_ac_preset)
-        ab.addWidget(self.ac_preset_combo, 1, 1)
+        ab.addWidget(field(self.ac_preset_combo), 1, 1)
         ab.addWidget(QLabel("On battery:"), 2, 0)
         self.batt_preset_combo = QComboBox()
         self.batt_preset_combo.addItems(PL_PRESET_ORDER)
         self.batt_preset_combo.setCurrentText(self.power_batt_preset)
         self.batt_preset_combo.currentTextChanged.connect(self._on_power_batt_preset)
-        ab.addWidget(self.batt_preset_combo, 2, 1)
+        ab.addWidget(field(self.batt_preset_combo), 2, 1)
         v.addWidget(adapt_box)
 
         bench_btn = QPushButton("Compare presets (benchmark)…")
