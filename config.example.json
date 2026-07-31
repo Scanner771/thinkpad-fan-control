@@ -28,6 +28,7 @@
   "power_adapt": false,
   "power_ac_preset": "Performance",
   "power_batt_preset": "Balanced",
+  "gpu_adapt": false,
   "desktop_notify": true,
   "telemetry": {
     "enabled": false,

@@ -1,6 +1,7 @@
 #!/bin/bash
 # fanctl - privileged ThinkPad helper for fan-control.py.
-# Multi-command: fan level, battery charge threshold, CPU RAPL power limits.
+# Multi-command: fan level, battery charge threshold, CPU RAPL power limits,
+# Intel iGPU frequency limits.
 # Installed to /usr/local/bin/fanctl and invoked via NOPASSWD sudo.
 # Backward compatible: `fanctl <level>` still works as before.
 set -euo pipefail
@@ -13,6 +14,32 @@ cmd="${1:-}"
 arg="${2:-}"
 
 is_int() { [[ "$1" =~ ^[0-9]+$ ]]; }
+
+# Resolve the i915 DRM card by driver, not by a hardcoded cardN — the number
+# is not stable across boots when more than one DRM device is present.
+_gpu_dir() {
+    local c d
+    for c in /sys/class/drm/card[0-9]*; do
+        [ -e "$c/gt_max_freq_mhz" ] || continue
+        d=$(readlink -f "$c/device/driver" 2>/dev/null || true)
+        if [ "${d##*/}" = "i915" ]; then echo "$c"; return 0; fi
+    done
+    echo "no i915 DRM card with gt_*_freq_mhz found" >&2
+    exit 4
+}
+
+# Clamp to the hardware-reported range so a bad value can't wedge the GPU.
+# RPn = hardware floor, RP0 = hardware ceiling.
+_gpu_set() {
+    local node="$1" val="$2" g rpn rp0
+    is_int "$val" || { echo "$node needs an integer (MHz)" >&2; exit 2; }
+    g=$(_gpu_dir)
+    rpn=$(cat "$g/gt_RPn_freq_mhz")
+    rp0=$(cat "$g/gt_RP0_freq_mhz")
+    [ "$val" -ge "$rpn" ] && [ "$val" -le "$rp0" ] \
+        || { echo "$node must be ${rpn}-${rp0} MHz (hardware range), got $val" >&2; exit 2; }
+    echo "$val" > "$g/$node"
+}
 
 _fan_ready() {
     if [ "$(cat /sys/module/thinkpad_acpi/parameters/fan_control 2>/dev/null)" != "Y" ]; then
@@ -57,7 +84,24 @@ case "$cmd" in
         is_int "$arg" && [ "$arg" -ge 15 ] && [ "$arg" -le 135 ] \
             || { echo "pl2 needs an integer 15-135 (watts)" >&2; exit 2; }
         echo $((arg * 1000000)) > "$RAPL/constraint_1_power_limit_uw" ;;
+    # --- Intel iGPU frequency floor (MHz) ---
+    gpu-min)
+        _gpu_set gt_min_freq_mhz "$arg" ;;
+    # --- Intel iGPU frequency ceiling (MHz) ---
+    gpu-max)
+        _gpu_set gt_max_freq_mhz "$arg" ;;
+    # --- Intel iGPU boost frequency (MHz) ---
+    gpu-boost)
+        _gpu_set gt_boost_freq_mhz "$arg" ;;
+    # --- restore the iGPU to its full hardware range (RPn..RP0) ---
+    gpu-reset)
+        g=$(_gpu_dir)
+        rpn=$(cat "$g/gt_RPn_freq_mhz"); rp0=$(cat "$g/gt_RP0_freq_mhz")
+        echo "$rpn" > "$g/gt_min_freq_mhz"
+        echo "$rp0" > "$g/gt_max_freq_mhz"
+        echo "$rp0" > "$g/gt_boost_freq_mhz" ;;
     *)
-        echo "usage: fanctl {<level>|level L|charge-stop N|charge-start N|pl1 W|pl2 W}" >&2
+        echo "usage: fanctl {<level>|level L|charge-stop N|charge-start N|pl1 W|pl2 W|"\
+"gpu-min MHz|gpu-max MHz|gpu-boost MHz|gpu-reset}" >&2
         exit 2 ;;
 esac

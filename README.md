@@ -8,11 +8,12 @@ thermostat — with a live temp/RPM graph and AC/battery-aware profiles.
 ![ThinkPad Fan Control — Fan tab](docs/screenshot.png)
 
 <details>
-<summary>More screenshots — Sensors, Battery, Power</summary>
+<summary>More screenshots — Sensors, Battery, Power, GPU</summary>
 
 ![Sensors](docs/tab-sensors.png)
 ![Battery](docs/tab-battery.png)
 ![Power](docs/tab-power.png)
+![GPU](docs/tab-gpu.png)
 
 </details>
 
@@ -23,6 +24,11 @@ thermostat — with a live temp/RPM graph and AC/battery-aware profiles.
 - **AC / battery-aware** — separate curves and power presets, switched automatically on unplug.
 - **CPU power limits (Intel RAPL)** — PL1/PL2 presets (Quiet → Max), with a built-in
   benchmark that runs a sustained load at each preset and compares steady-state clock/temp.
+- **Intel iGPU frequency caps** — min/max clock limits with Quiet/Balanced/Performance/Max
+  presets, optional auto-cap on battery, and a 15-second keep-or-revert confirmation on every
+  change. Busy% is read from RC6 idle residency, so it works without root
+  (`intel_gpu_top` needs `CAP_PERFMON`). Note: most laptops already ship at the hardware
+  ceiling, so this can only cap *downward* — for heat, noise, and battery, not extra speed.
 - **Battery longevity** — set charge start/stop thresholds.
 - **Live graph** — temps, fan RPM, and measured package power draw; CSV export.
 - **Auto-profile** — detects games / compiles / AI workloads and switches presets.
@@ -48,7 +54,7 @@ Tested with **app version 2.1** on:
 | P1 Gen 4 | Intel 11th-gen (Tiger Lake-H) | Linux 6.x |
 
 Everything it drives — `thinkpad_acpi` fan control, Intel RAPL power limits,
-`platform_profile`, and `BAT0` charge thresholds — is common across recent ThinkPads,
+`platform_profile`, `BAT0` charge thresholds, and i915 `gt_*_freq_mhz` — is common across recent ThinkPads,
 and per-chassis details (fan count, hwmon indices, PL ceilings) are auto-detected;
 missing sensors are handled gracefully. **Other models (incl. P1 Gen 2) very likely
 work but are unverified** — reports welcome. Nothing here is model-hardcoded.
@@ -78,8 +84,12 @@ cp systemd/fan-control.service ~/.config/systemd/user/ && systemctl --user enabl
 The GUI only **reads** kernel sysfs directly (`/sys/class/hwmon`, `/sys/class/powercap`,
 `platform_profile`, `BAT0`). Every **privileged write** goes through `fanctl`, a small
 shell helper that validates its arguments before touching `/proc/acpi/ibm/fan`, the RAPL
-power-limit files, or the battery thresholds — so the passwordless-sudo grant is scoped
-to one auditable command, not to arbitrary root writes.
+power-limit files, the i915 GPU frequency nodes, or the battery thresholds — so the
+passwordless-sudo grant is scoped to one auditable command, not to arbitrary root writes.
+GPU writes are clamped to the hardware-reported `RPn..RP0` range and the i915 card is
+resolved by driver symlink rather than a hardcoded `cardN` (the number is not stable
+across boots). Only one instance can run at a time (`QLockFile`), so an autostart entry
+and a session restore can't end up both driving the fan.
 
 ## Configuration
 
@@ -97,7 +107,9 @@ and set `telemetry.enabled: true`.
 
 This app writes fan levels and CPU power limits. Curves are pre-ramped (idle above a
 dead stop) so a fan isn't spooling from standstill under a sudden all-core load, and a
-critical-temperature failsafe forces full speed regardless of the active curve. Still,
+critical-temperature failsafe forces full speed regardless of the active curve. GPU
+frequency caps are staged behind a 15-second keep-or-revert dialog and are clamped to the
+hardware range; nothing GPU-side persists, so a reboot always restores stock clocks. Still,
 you are overriding firmware defaults — understand your hardware's limits.
 
 ## License

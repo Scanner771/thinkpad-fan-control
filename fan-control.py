@@ -22,15 +22,16 @@ import time
 import urllib.request
 from collections import deque
 
-from PyQt6.QtCore import QPoint, QRect, QSize, QTimer, Qt
+from PyQt6.QtCore import (QLockFile, QObject, QPoint, QRect, QSize, QTimer, Qt,
+                          pyqtSignal)
 from PyQt6.QtGui import (QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPen,
                          QPixmap, QShortcut)
 from PyQt6.QtWidgets import (
     QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLayout,
-    QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QRadioButton,
-    QScrollArea, QSizePolicy, QSpinBox, QSystemTrayIcon, QTableWidget,
-    QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
+    QFileDialog, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
+    QLayout, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
+    QRadioButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QSystemTrayIcon,
+    QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
 FAN_PATH = "/proc/acpi/ibm/fan"
@@ -44,6 +45,27 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
 BAT_PATH = "/sys/class/power_supply/BAT0"
 RAPL_PATH = "/sys/class/powercap/intel-rapl:0"
+
+
+def _find_i915_dir():
+    """Resolve the i915 DRM card by driver, not a hardcoded cardN.
+
+    The card number is not stable across boots when several DRM devices exist,
+    so match on the driver symlink the same way the fanctl helper does.
+    """
+    for c in sorted(glob.glob("/sys/class/drm/card[0-9]*")):
+        if not os.path.exists(os.path.join(c, "gt_max_freq_mhz")):
+            continue
+        try:
+            drv = os.path.basename(os.path.realpath(os.path.join(c, "device", "driver")))
+        except OSError:
+            continue
+        if drv == "i915":
+            return c
+    return None
+
+
+GPU_PATH = _find_i915_dir()
 
 VERSION = "2.1"
 APP_PATH = os.path.abspath(__file__)
@@ -157,15 +179,13 @@ READOUT_CSS = ("background: #0f1114; border: 1px solid #2a2e37; "
 
 CURVE_LEVELS = ["0", "1", "2", "3", "4", "5", "6", "7", "full-speed"]
 CRITICAL_TEMP = 90
-
-# Below this the window drops the title block and shrinks the graphs.
-COMPACT_W = 420
-COMPACT_H = 560
 REASSERT_TICKS = 60       # EC state unreadable: blind re-assert every N s (defeats EC watchdog)
 REASSERT_DRIFT_TICKS = 5  # EC drifted off the held level: re-write, then wait N s before retrying
 TARGET_INTERVAL = 3       # seconds between target-mode adjustments
 DEFAULT_TARGET = 80       # °C for target mode
 DEFAULT_HYSTERESIS = 5
+CURVE_SMOOTH_SAMPLES = 5  # median-filter window (ticks) for the curve input
+CURVE_DOWN_DWELL = 30     # s to hold a level before allowing a DOWNSHIFT (up is instant)
 
 DEFAULT_CURVE = [
     {"temp": 0, "level": "0"},
@@ -242,6 +262,16 @@ PL_PRESET_ORDER = ["Quiet", "Balanced", "Performance", "Max"]
 PL_PPD = {"Quiet": "power-saver", "Balanced": "balanced",
           "Performance": "performance", "Max": "performance"}
 
+# iGPU ceiling presets, as a PERCENTAGE of the hardware max (RP0). Percentages
+# rather than fixed MHz so the same names work on any Intel part. Note these can
+# only cap the GPU *down* — it already ships at its hardware ceiling, so there is
+# no "overclock" direction to offer.
+GPU_PRESETS = {"Quiet": 0.45, "Balanced": 0.70, "Performance": 0.85, "Max": 1.00}
+GPU_PRESET_ORDER = ["Quiet", "Balanced", "Performance", "Max"]
+# Deadman window: a GPU cap reverts itself unless the user confirms, so a setting
+# that makes the desktop unusable can't stick just because you walked away.
+GPU_REVERT_SECS = 15
+
 HISTORY_MAX = 3600          # samples kept for CSV export (~1 h at 1 s)
 BENCH_LOAD_SECS = 25        # per-preset sustained load in the in-app benchmark
 BENCH_SAMPLE_SECS = 10      # trailing window sampled for steady-state clock/temp
@@ -285,6 +315,7 @@ def load_config() -> dict:
         "geometry": None,
         "tab": 0,
         "power_adapt": False,
+        "gpu_adapt": False,
         "power_ac_preset": "Performance",
         "power_batt_preset": "Balanced",
     }
@@ -324,6 +355,7 @@ def load_config() -> dict:
     if isinstance(saved.get("tab"), int) and 0 <= saved["tab"] < 16:
         cfg["tab"] = saved["tab"]
     cfg["power_adapt"] = bool(saved.get("power_adapt", False))
+    cfg["gpu_adapt"] = bool(saved.get("gpu_adapt", False))
     if saved.get("power_ac_preset") in PL_PRESETS:
         cfg["power_ac_preset"] = saved["power_ac_preset"]
     if saved.get("power_batt_preset") in PL_PRESETS:
@@ -629,6 +661,48 @@ def read_cpu_power() -> dict:
     return d
 
 
+# Per-caller RC6 sample state. Several consumers read the GPU at once (the 1 Hz
+# poll, the GPU tab, the benchmark); a single shared "last sample" would let
+# whichever called second see a near-zero window and get busy=None. Each passes
+# its own key so their deltas stay independent.
+_gpu_rc6_last = {}
+
+
+def read_gpu(who: str = "default") -> dict:
+    """Intel iGPU clocks plus a root-free busy%.
+
+    intel_gpu_top needs CAP_PERFMON, so busy% is derived from RC6 (GPU idle)
+    residency instead: busy = 100 - idle_ms/elapsed_ms. Needs two samples, so
+    the first call for a given `who` returns busy=None.
+    """
+    if not GPU_PATH:
+        return {}
+    d = {
+        "cur": _read_int(f"{GPU_PATH}/gt_cur_freq_mhz"),
+        "act": _read_int(f"{GPU_PATH}/gt_act_freq_mhz"),
+        "min": _read_int(f"{GPU_PATH}/gt_min_freq_mhz"),
+        "max": _read_int(f"{GPU_PATH}/gt_max_freq_mhz"),
+        "boost": _read_int(f"{GPU_PATH}/gt_boost_freq_mhz"),
+        "rpn": _read_int(f"{GPU_PATH}/gt_RPn_freq_mhz"),
+        "rp0": _read_int(f"{GPU_PATH}/gt_RP0_freq_mhz"),
+    }
+    d["busy"] = None
+    rc6 = _read_int(f"{GPU_PATH}/power/rc6_residency_ms")
+    now = time.monotonic()
+    if rc6 is not None:
+        prev = _gpu_rc6_last.get(who)
+        if prev:
+            elapsed = (now - prev[1]) * 1000.0
+            # Ignore degenerate windows; a too-short gap makes busy% meaningless.
+            if elapsed >= 250:
+                busy = 100.0 - ((rc6 - prev[0]) / elapsed * 100.0)
+                d["busy"] = max(0.0, min(100.0, busy))
+                _gpu_rc6_last[who] = (rc6, now)
+        else:
+            _gpu_rc6_last[who] = (rc6, now)
+    return d
+
+
 def read_throttle_count() -> int:
     """Sum of per-core thermal-throttle events; a rising total = throttling now."""
     total = 0
@@ -736,6 +810,9 @@ def send_ntfy(tel: dict, title: str, message: str, priority: str = "urgent", tag
 # --------------------------------------------------------------------------- #
 # Live graph
 # --------------------------------------------------------------------------- #
+# Below this the window drops the title block and shrinks the graphs.
+COMPACT_W = 420
+COMPACT_H = 560
 class FlowLayout(QLayout):
     """Row layout that wraps onto the next line instead of overflowing.
 
@@ -908,6 +985,100 @@ class Sparkline(QWidget):
 # --------------------------------------------------------------------------- #
 # Curve editor
 # --------------------------------------------------------------------------- #
+class GpuSpark(QWidget):
+    """Rolling iGPU busy% trace (0-100). Separate from Sparkline, which is
+    hardwired to temp/RPM ranges."""
+    SPAN = 120
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(70)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.busy = deque(maxlen=self.SPAN)
+
+    def add(self, busy):
+        if busy is not None:
+            self.busy.append(busy)
+            self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), QColor("#1b1b1b"))
+        w, h = self.width(), self.height()
+        p.setPen(QPen(QColor("#333"), 1))
+        for t in (25, 50, 75):
+            y = h - t / 100 * (h - 4) - 2
+            p.drawLine(0, int(y), w, int(y))
+        if len(self.busy) < 2:
+            p.end()
+            return
+        pen = QPen(QColor("#f39c12"))
+        pen.setWidth(2)
+        p.setPen(pen)
+        pts = [(w * i / (self.SPAN - 1), h - max(0, min(100, v)) / 100 * (h - 4) - 2)
+               for i, v in enumerate(self.busy)]
+        for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+            p.drawLine(int(x1), int(y1), int(x2), int(y2))
+        p.end()
+
+
+class GpuRevertDialog(QDialog):
+    """Deadman confirm: keeps the new GPU limits only if the user actively says so.
+
+    Same idea as a display-resolution change — if the cap makes the desktop
+    unusable, or the user just walks away, it reverts itself.
+    """
+    def __init__(self, parent, secs, revert_cb):
+        super().__init__(parent)
+        self.setWindowTitle("Keep GPU limits?")
+        self.setModal(True)
+        self._left = secs
+        self._revert_cb = revert_cb
+        self._kept = False
+        v = QVBoxLayout(self)
+        self.msg = QLabel("")
+        self.msg.setWordWrap(True)
+        v.addWidget(self.msg)
+        row = QHBoxLayout()
+        keep = QPushButton("Keep")
+        keep.setDefault(True)
+        keep.clicked.connect(self._keep)
+        undo = QPushButton("Revert now")
+        undo.clicked.connect(self.reject)
+        row.addWidget(undo)
+        row.addWidget(keep)
+        v.addLayout(row)
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(1000)
+        self._paint()
+
+    def _paint(self):
+        self.msg.setText(
+            f"New iGPU limits applied.\n\nReverting automatically in {self._left}s "
+            "unless you choose Keep."
+        )
+
+    def _tick(self):
+        self._left -= 1
+        if self._left <= 0:
+            self.reject()
+            return
+        self._paint()
+
+    def _keep(self):
+        self._kept = True
+        self._timer.stop()
+        self.accept()
+
+    def reject(self):
+        self._timer.stop()
+        if not self._kept:
+            self._revert_cb()
+        super().reject()
+
+
 class CurveDialog(QDialog):
     def __init__(self, curves: dict, hysteresis: int, parent=None):
         super().__init__(parent)
@@ -1048,8 +1219,9 @@ class BenchDialog(QDialog):
         self.status = QLabel(self._status)
         self.status.setFont(QFont("monospace", 9))
         v.addWidget(self.status)
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Preset", "Throughput", "Clock", "Peak"])
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["Preset", "Throughput", "Clock", "Peak", "GPU", "GPU clk"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.table.verticalHeader().setVisible(False)
         v.addWidget(self.table)
@@ -1099,12 +1271,21 @@ class BenchDialog(QDialog):
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
                 time.sleep(max(1, BENCH_LOAD_SECS - BENCH_SAMPLE_SECS))
                 fsum = fn = tmax = 0
+                gsum = gn = gmhz_sum = gmhz_n = 0
                 for _ in range(BENCH_SAMPLE_SECS):
                     cp = read_cpu_power()
                     tmax = max(tmax, read_temps()["cpu"])
                     if cp["freq_avg"]:
                         fsum += cp["freq_avg"]
                         fn += 1
+                    if GPU_PATH:
+                        g = read_gpu("bench")
+                        if g.get("busy") is not None:
+                            gsum += g["busy"]
+                            gn += 1
+                        if g.get("act"):
+                            gmhz_sum += g["act"]
+                            gmhz_n += 1
                     time.sleep(1)
                 try:
                     out = proc.communicate(timeout=20)[0] or ""
@@ -1121,7 +1302,9 @@ class BenchDialog(QDialog):
                             pass
                         break
                 self._results.append({"name": name, "bogo": bogo,
-                                      "mhz": (fsum // fn if fn else 0), "temp": tmax})
+                                      "mhz": (fsum // fn if fn else 0), "temp": tmax,
+                                      "gpu_busy": (gsum / gn if gn else None),
+                                      "gpu_mhz": (gmhz_sum // gmhz_n if gmhz_n else 0)})
             self._status = "Done — power limit restored."
         except Exception as e:                       # noqa: BLE001 - report to UI
             self._status = f"Error: {e}"
@@ -1140,8 +1323,11 @@ class BenchDialog(QDialog):
             r = self._results[self.table.rowCount()]
             i = self.table.rowCount()
             self.table.insertRow(i)
+            gb = r.get("gpu_busy")
             cells = [r["name"], f'{r["bogo"]:.0f} ops/s',
-                     f'{r["mhz"]} MHz', f'{r["temp"]}°C']
+                     f'{r["mhz"]} MHz', f'{r["temp"]}°C',
+                     "—" if gb is None else f'{gb:.0f}%',
+                     f'{r.get("gpu_mhz", 0)} MHz']
             for c, val in enumerate(cells):
                 self.table.setItem(i, c, QTableWidgetItem(val))
         if self._done:
@@ -1175,6 +1361,8 @@ class FanControl(QMainWindow):
         self._auto_tick = 0
         self._auto_applying = False
         self._curve_idx = 0
+        self._curve_temps = deque(maxlen=CURVE_SMOOTH_SAMPLES)
+        self._curve_changed = 0.0
         self._target_idx = CURVE_LEVELS.index("2")
         self._target_tick = 0
         self._applied_level = None
@@ -1191,6 +1379,7 @@ class FanControl(QMainWindow):
         self._geometry = cfg.get("geometry")
         self._start_tab = cfg.get("tab", 0)
         self.power_adapt = cfg["power_adapt"]
+        self.gpu_adapt = cfg["gpu_adapt"]
         self.power_ac_preset = cfg["power_ac_preset"]
         self.power_batt_preset = cfg["power_batt_preset"]
         self._last_ac = None                    # track AC transitions for auto-adapt
@@ -1198,7 +1387,7 @@ class FanControl(QMainWindow):
         self._throttling = False
         self._fan_warn = ""
         self._fan_low_ticks = 0
-        self._history = deque(maxlen=HISTORY_MAX)   # (t, cpu, 2nd, rpm, level, pl1)
+        self._history = deque(maxlen=HISTORY_MAX)   # (t, cpu, 2nd, rpm, level, pl1, gpu%)
         self._max_rpm = MAX_RPM                 # auto-calibrated from observed peak
         self._bench_running = False
 
@@ -1291,6 +1480,7 @@ class FanControl(QMainWindow):
 
         # Smart Curve + preset selector + editor
         curve_row = QHBoxLayout()
+        curve_row.setSpacing(8)
         self.curve_rb = QRadioButton("Smart Curve")
         self.curve_rb.setProperty("fan_level", "curve")
         self.curve_rb.toggled.connect(self._on_level_changed)
@@ -1360,6 +1550,7 @@ class FanControl(QMainWindow):
         self.tabs.addTab(self._scrollable(self._build_sensors_tab()), "Sensors")
         self.tabs.addTab(self._scrollable(self._build_battery_tab()), "Battery")
         self.tabs.addTab(self._scrollable(self._build_power_tab()), "Power")
+        self.tabs.addTab(self._scrollable(self._build_gpu_tab()), "GPU")
         self.tabs.currentChanged.connect(lambda _i: self._refresh_aux())
 
         if QSystemTrayIcon.isSystemTrayAvailable():
@@ -1444,8 +1635,10 @@ class FanControl(QMainWindow):
         self.tabs.tabBar().setStyleSheet(
             "QTabBar::tab { padding: 5px 8px; margin: 0 2px 0 0; }"
             if compact else "")
-        if getattr(self, "graph", None) is not None:
-            self.graph.setMinimumHeight(56 if compact else 90)
+        for attr in ("graph", "r_graph"):
+            g = getattr(self, attr, None)
+            if g is not None:
+                g.setMinimumHeight(56 if compact else 90)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -1463,6 +1656,7 @@ class FanControl(QMainWindow):
             "geometry": [self.x(), self.y(), self.width(), self.height()],
             "tab": self.tabs.currentIndex() if hasattr(self, "tabs") else 0,
             "power_adapt": self.power_adapt,
+            "gpu_adapt": self.gpu_adapt,
             "power_ac_preset": self.power_ac_preset,
             "power_batt_preset": self.power_batt_preset,
         }
@@ -1668,8 +1862,25 @@ class FanControl(QMainWindow):
             set_ppd(PL_PPD.get(preset, "balanced"))
         except Exception:
             pass
+        # Cap the iGPU to the same named preset. No deadman here on purpose: this
+        # is an automatic transition, not a user experiment, and plugging back in
+        # restores the AC preset anyway.
+        if self.gpu_adapt and GPU_PATH:
+            g = read_gpu()
+            rpn, rp0 = g.get("rpn") or 350, g.get("rp0") or 1450
+            hi = max(rpn, min(rp0, int(rp0 * GPU_PRESETS.get(preset, 1.0) / 50) * 50))
+            try:
+                self._write_gpu_limits(g.get("min") or rpn, hi)
+            except Exception:
+                pass
+            if hasattr(self, "gpu_max_spin"):
+                self.gpu_max_spin.blockSignals(True)
+                self.gpu_max_spin.setValue(hi)
+                self.gpu_max_spin.blockSignals(False)
         if hasattr(self, "power_info"):
             self._refresh_power()
+        if hasattr(self, "gpu_info"):
+            self._refresh_gpu()
 
     # ---- tray icon shows current CPU temp ----
     def _paint_tray_icon(self, temp):
@@ -1700,7 +1911,8 @@ class FanControl(QMainWindow):
         try:
             with open(path, "w", newline="") as f:
                 w = csv.writer(f)
-                w.writerow(["epoch", "cpu_c", "second_c", "fan_rpm", "fan_level", "pl1_w"])
+                w.writerow(["epoch", "cpu_c", "second_c", "fan_rpm", "fan_level",
+                            "pl1_w", "gpu_busy_pct"])
                 w.writerows(self._history)
             QMessageBox.information(self, "Export",
                                     f"Wrote {len(self._history)} rows to\n{path}")
@@ -1754,7 +1966,10 @@ class FanControl(QMainWindow):
 
         # history for CSV export
         pl1_now = (_read_int(f"{RAPL_PATH}/constraint_0_power_limit_uw") or 0) // 1_000_000
-        self._history.append((int(time.time()), temps["cpu"], second_val, rpm, level, pl1_now))
+        gpu_busy = read_gpu("poll").get("busy") if GPU_PATH else None
+        self._history.append((int(time.time()), temps["cpu"], second_val, rpm,
+                              level, pl1_now,
+                              "" if gpu_busy is None else round(gpu_busy, 1)))
 
         # auto-calibrate the RPM bar scale from the observed peak (fans top out
         # well below the 8000 default, so bars would never fill otherwise)
@@ -1877,12 +2092,34 @@ class FanControl(QMainWindow):
                 self._auto_applying = False
 
     def _apply_curve(self, temps):
-        maxt = max(temps["cpu"], temps["gpu"])
+        raw = max(temps["cpu"], temps["gpu"])
+        # coretemp temp1_input (CPU package) is an INSTANTANEOUS reading: while
+        # idle it swings 46->59->46 between one-second ticks. With the 45/55
+        # curve and hysteresis 5, every spike >=55 promoted to level 6 and the
+        # next normal sample (<50) demoted straight back to 4 — 93 `sudo fanctl`
+        # writes in 10 minutes off a genuinely idle machine. Median-filter the
+        # curve input so a single spike cannot move the index; sustained load
+        # moves every sample and still ramps. CRITICAL_TEMP stays on the raw
+        # value so a real thermal event is never smoothed away.
+        self._curve_temps.append(raw)
+        ordered = sorted(self._curve_temps)
+        maxt = ordered[len(ordered) // 2]
         steps = self.active_curve()
         self._curve_idx = curve_index(maxt, steps, self._curve_idx, self.hysteresis)
         target = steps[self._curve_idx]["level"]
-        if maxt >= CRITICAL_TEMP:
+        if raw >= CRITICAL_TEMP:
             target = "full-speed"
+            self._curve_changed = 0.0          # never hold a critical ramp back
+        # Asymmetric dwell: ramp UP immediately (thermal safety), but hold a
+        # level for CURVE_DOWN_DWELL before easing DOWN. Median filtering alone
+        # still left 11 writes/2min because bursty load genuinely crosses the
+        # 55 promote / 50 demote pair; a fan should not chase that.
+        cur = self._desired_level
+        if cur in CURVE_LEVELS and target in CURVE_LEVELS and target != cur:
+            if CURVE_LEVELS.index(target) < CURVE_LEVELS.index(cur):
+                if time.monotonic() - self._curve_changed < CURVE_DOWN_DWELL:
+                    return                     # too soon to quieten down; hold
+            self._curve_changed = time.monotonic()
         self._set_desired(target)
 
     def _apply_target(self, temps):
@@ -1918,9 +2155,10 @@ class FanControl(QMainWindow):
         """Keep the EC on the level we hold, but only WRITE when it has drifted.
 
         This used to fire an unconditional `sudo fanctl <level>` every
-        REASSERT_TICKS seconds whether or not the EC had moved — all no-ops,
-        which made a single process look like two writers fighting. The EC level
-        is already read once per tick by _refresh, so compare and stay quiet.
+        REASSERT_TICKS seconds whether or not the EC had moved — 1037 writes in
+        the audit log, all no-ops, which is what made a single process look like
+        two writers fighting. Now the EC level is already read once per tick by
+        _refresh, so compare against it and stay quiet when it matches.
         """
         if not self._desired_level or self._desired_level == "auto":
             return
@@ -2206,8 +2444,8 @@ class FanControl(QMainWindow):
         self.power_adapt_cb.setToolTip("On unplug, switch to the battery preset; on AC, the AC preset.")
         self.power_adapt_cb.setChecked(self.power_adapt)
         self.power_adapt_cb.toggled.connect(self._on_power_adapt)
-        ab.addWidget(self.power_adapt_cb, 0, 0, 1, 2)
         ab.setColumnStretch(1, 1)
+        ab.addWidget(self.power_adapt_cb, 0, 0, 1, 2)
         ab.addWidget(QLabel("On AC:"), 1, 0)
         self.ac_preset_combo = QComboBox()
         self.ac_preset_combo.addItems(PL_PRESET_ORDER)
@@ -2269,6 +2507,186 @@ class FanControl(QMainWindow):
             self.ppd_combo.setCurrentText(cur)
             self.ppd_combo.blockSignals(False)
 
+    # ---- GPU tab ---------------------------------------------------------- #
+    def _build_gpu_tab(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(8, 8, 8, 8)
+        v.setSpacing(10)
+
+        self.gpu_info = QLabel("Reading…")
+        self.gpu_info.setFont(QFont("monospace", 10))
+        self.gpu_info.setTextFormat(Qt.TextFormat.RichText)
+        self.gpu_info.setStyleSheet(READOUT_CSS)
+        shrinkable(self.gpu_info)
+        v.addWidget(self.gpu_info)
+
+        if not GPU_PATH:
+            note = QLabel("No Intel i915 GPU found — nothing to control on this machine.")
+            note.setWordWrap(True)
+            note.setStyleSheet("color:#888;")
+            v.addWidget(note)
+            v.addStretch(1)
+            return w
+
+        self.gpu_spark = GpuSpark()
+        self.gpu_spark.setToolTip("iGPU busy% (from RC6 idle residency), last ~2 min")
+        v.addWidget(self.gpu_spark)
+
+        g = read_gpu()
+        rpn, rp0 = g.get("rpn") or 350, g.get("rp0") or 1450
+
+        box = QGroupBox("iGPU frequency limits")
+        gl = QGridLayout(box)
+        note = QLabel(
+            f"Hardware range is {rpn}–{rp0} MHz and the GPU already ships at that "
+            "ceiling, so these can only cap it DOWNWARD — good for battery life, heat "
+            "and fan noise, but there is no speed to unlock. Max restores stock."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#888;")
+        gl.addWidget(note, 0, 0, 1, 3)
+        gl.setColumnStretch(1, 1)
+
+        gl.addWidget(QLabel("Min clock:"), 1, 0)
+        self.gpu_min_spin = QSpinBox()
+        self.gpu_min_spin.setRange(rpn, rp0)
+        self.gpu_min_spin.setSingleStep(50)
+        self.gpu_min_spin.setSuffix(" MHz")
+        self.gpu_min_spin.setValue(g.get("min") or rpn)
+        gl.addWidget(field(self.gpu_min_spin, 100, 170), 1, 1)
+
+        gl.addWidget(QLabel("Max clock:"), 2, 0)
+        self.gpu_max_spin = QSpinBox()
+        self.gpu_max_spin.setRange(rpn, rp0)
+        self.gpu_max_spin.setSingleStep(50)
+        self.gpu_max_spin.setSuffix(" MHz")
+        self.gpu_max_spin.setValue(g.get("max") or rp0)
+        gl.addWidget(field(self.gpu_max_spin, 100, 170), 2, 1)
+
+        apply_btn = QPushButton("Apply")
+        apply_btn.clicked.connect(lambda: self._apply_gpu())
+        gl.addWidget(apply_btn, 1, 2, 2, 1)
+
+        pr = QGridLayout()
+        pr.setSpacing(6)
+        for i, name in enumerate(GPU_PRESET_ORDER):
+            mhz = int(rp0 * GPU_PRESETS[name] / 50) * 50
+            mhz = max(rpn, min(rp0, mhz))
+            btn = QPushButton(f"{name}\n{mhz} MHz cap")
+            btn.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            btn.clicked.connect(lambda _c, x=mhz: self._apply_gpu(rpn_min=None, mx=x))
+            pr.addWidget(btn, i // 2, i % 2)
+        gl.addLayout(pr, 3, 0, 1, 3)
+
+        reset_btn = QPushButton("Restore hardware default")
+        reset_btn.clicked.connect(self._reset_gpu)
+        gl.addWidget(reset_btn, 4, 0, 1, 3)
+        v.addWidget(box)
+
+        adapt_box = QGroupBox("Auto-cap by AC / battery")
+        ab = QVBoxLayout(adapt_box)
+        self.gpu_adapt_cb = QCheckBox("Cap the iGPU to match the power preset")
+        self.gpu_adapt_cb.setToolTip(
+            "On battery, cap the iGPU to the battery preset; on AC, restore the AC "
+            "preset. Follows the same presets as the Power tab."
+        )
+        self.gpu_adapt_cb.setChecked(self.gpu_adapt)
+        self.gpu_adapt_cb.toggled.connect(self._on_gpu_adapt)
+        ab.addWidget(self.gpu_adapt_cb)
+        v.addWidget(adapt_box)
+        v.addStretch(1)
+        return w
+
+    def _on_gpu_adapt(self, checked):
+        self.gpu_adapt = checked
+        self._save()
+
+    def _write_gpu_limits(self, lo, hi):
+        """Push min/max/boost. Order matters: widen the ceiling before raising the
+        floor, and drop the floor before lowering the ceiling, or the kernel
+        rejects the write as out-of-order."""
+        if hi >= (read_gpu().get("max") or hi):
+            fanctl_cmd("gpu-max", hi)
+            fanctl_cmd("gpu-min", lo)
+        else:
+            fanctl_cmd("gpu-min", lo)
+            fanctl_cmd("gpu-max", hi)
+        fanctl_cmd("gpu-boost", hi)
+
+    def _apply_gpu(self, rpn_min=None, mx=None):
+        if rpn_min is not None:
+            self.gpu_min_spin.setValue(rpn_min)
+        if mx is not None:
+            self.gpu_max_spin.setValue(mx)
+        lo = self.gpu_min_spin.value()
+        hi = max(self.gpu_max_spin.value(), lo)   # max must be >= min
+        self.gpu_max_spin.setValue(hi)
+
+        before = read_gpu()
+        prev_lo = before.get("min") or self.gpu_min_spin.minimum()
+        prev_hi = before.get("max") or self.gpu_max_spin.maximum()
+        unchanged = (prev_lo == lo and prev_hi == hi)
+
+        try:
+            self._write_gpu_limits(lo, hi)
+            self._refresh_gpu()
+        except FileNotFoundError:
+            self._helper_error()
+            return
+        except subprocess.CalledProcessError as e:
+            self._helper_error((e.stderr or b"").decode(errors="replace").strip())
+            return
+
+        if unchanged:
+            return          # nothing actually changed — no need to nag
+
+        def _revert():
+            try:
+                self._write_gpu_limits(prev_lo, prev_hi)
+            except Exception:
+                pass        # the helper already errored once; don't stack dialogs
+            self.gpu_min_spin.setValue(prev_lo)
+            self.gpu_max_spin.setValue(prev_hi)
+            self._refresh_gpu()
+
+        GpuRevertDialog(self, GPU_REVERT_SECS, _revert).exec()
+
+    def _reset_gpu(self):
+        try:
+            fanctl_cmd("gpu-reset")
+            g = read_gpu()
+            self.gpu_min_spin.setValue(g.get("min") or self.gpu_min_spin.minimum())
+            self.gpu_max_spin.setValue(g.get("max") or self.gpu_max_spin.maximum())
+            self._refresh_gpu()
+        except FileNotFoundError:
+            self._helper_error()
+        except subprocess.CalledProcessError as e:
+            self._helper_error((e.stderr or b"").decode(errors="replace").strip())
+
+    def _refresh_gpu(self):
+        g = read_gpu("tab")
+        if not g:
+            self.gpu_info.setText("No Intel iGPU detected.")
+            return
+        busy = g.get("busy")
+        busy_s = f"{busy:.0f}%" if busy is not None else "sampling…"
+        # act==0 isn't an error: the GPU is parked in RC6. Say so, because a bare
+        # "0 MHz" reads like a failed sensor.
+        act = g.get("act")
+        act_s = "idle (RC6)" if act == 0 else f'{act if act is not None else "?"} MHz'
+        capped = (g.get("max") or 0) < (g.get("rp0") or 0)
+        self.gpu_info.setText("<br>".join([
+            f'Clock now: {act_s}&nbsp;&nbsp;&nbsp;Requested: {g.get("cur", "?")} MHz',
+            f'Limits: {g.get("min", "?")}–{g.get("max", "?")} MHz'
+            + (' <b>(capped)</b>' if capped else ' (stock)')
+            + f'&nbsp;&nbsp;&nbsp;Boost: {g.get("boost", "?")} MHz',
+            f'Hardware range: {g.get("rpn", "?")}–{g.get("rp0", "?")} MHz'
+            f'&nbsp;&nbsp;&nbsp;Busy: {busy_s}',
+        ]))
+        if hasattr(self, "gpu_spark"):
+            self.gpu_spark.add(busy)
+
     def _helper_error(self, msg=""):
         QMessageBox.warning(
             self, "Fan Control",
@@ -2288,6 +2706,8 @@ class FanControl(QMainWindow):
             self._refresh_battery()
         elif name == "Power":
             self._refresh_power()
+        elif name == "GPU":
+            self._refresh_gpu()
 
     def _tray_activated(self, reason):
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
@@ -2311,6 +2731,20 @@ class FanControl(QMainWindow):
 
 
 if __name__ == "__main__":
+    # Single-instance guard. Two launchers exist in practice (the XDG autostart
+    # entry and KDE session restore), and that has raced into two live
+    # instances both driving the fan. QLockFile is pid-aware: if the previous
+    # process died without cleaning up, removeStaleLockFile() reclaims it.
+    _lock = QLockFile(os.path.join(
+        os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "fan-control.lock"))
+    _lock.setStaleLockTime(30_000)
+    if not _lock.tryLock(100):
+        _lock.removeStaleLockFile()
+        if not _lock.tryLock(100):
+            print("fan-control: another instance is already running "
+                  "(check the system tray).", file=sys.stderr)
+            sys.exit(0)
+
     app = QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
     app.setQuitOnLastWindowClosed(False)
