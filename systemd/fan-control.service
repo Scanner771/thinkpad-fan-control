@@ -1,5 +1,8 @@
 # User service: ~/.config/systemd/user/fan-control.service
 # Enable with:  systemctl --user enable --now fan-control.service
+#
+# ExecStart assumes the repo was cloned to ~/thinkpad-fan-control (as in the
+# README). If it lives elsewhere, edit the path below before enabling.
 [Unit]
 Description=ThinkPad Fan Control
 After=graphical-session.target
@@ -8,7 +11,7 @@ After=graphical-session.target
 Type=simple
 # Resolve the running X/Wayland session cookie so the tray icon appears.
 Environment=XAUTHORITY=%h/.Xauthority
-ExecStart=/usr/bin/python3 %h/fan-control.py
+ExecStart=/usr/bin/python3 %h/thinkpad-fan-control/fan-control.py
 Restart=on-failure
 RestartSec=5
 

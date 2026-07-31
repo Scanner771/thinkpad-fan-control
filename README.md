@@ -46,12 +46,12 @@ thermostat — with a live temp/RPM graph and AC/battery-aware profiles.
 
 ## Compatibility
 
-Tested with **app version 2.1** on:
+Tested with **app version 2.2** on:
 
-| ThinkPad model | CPU generation | Kernel |
-|---|---|---|
-| P1 Gen 3 | Intel 10th-gen (Comet Lake-H) | Linux 6.x |
-| P1 Gen 4 | Intel 11th-gen (Tiger Lake-H) | Linux 6.x |
+| ThinkPad model | CPU generation | Kernel | Distro |
+|---|---|---|---|
+| P1 Gen 3 | Intel 10th-gen (Comet Lake-H) | Linux 6.12 | Debian 13 |
+| P1 Gen 4 | Intel 11th-gen (Tiger Lake-H) | Linux 7.1 (zen) | Arch |
 
 Everything it drives — `thinkpad_acpi` fan control, Intel RAPL power limits,
 `platform_profile`, `BAT0` charge thresholds, and i915 `gt_*_freq_mhz` — is common across recent ThinkPads,
@@ -78,6 +78,27 @@ python3 fan-control.py
 ```
 cp systemd/fan-control.service ~/.config/systemd/user/ && systemctl --user enable --now fan-control.service
 ```
+
+### Uninstall
+
+```
+sudo rm -f /usr/local/bin/fanctl /etc/sudoers.d/fan-control /etc/modprobe.d/thinkpad_acpi.conf && systemctl --user disable --now fan-control.service
+```
+
+That removes the helper, the passwordless-sudo grant, and the `fan_control=1` persistence.
+Fan control returns to firmware on the next reboot (or `sudo modprobe -r thinkpad_acpi &&
+sudo modprobe thinkpad_acpi`). Settings in `~/.config/fan-control/` are left alone — delete
+that directory too if you want a clean slate.
+
+## Keyboard shortcuts
+
+| Key | Action |
+|---|---|
+| `Ctrl+1` … `Ctrl+5` | jump to tab |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | cycle tabs |
+| `Ctrl+R` / `F5` | force a refresh |
+| `Esc` / `Ctrl+W` | hide to tray (or close if there's no tray) |
+| `Ctrl+Q` | quit |
 
 ## How it works
 
@@ -111,6 +132,10 @@ critical-temperature failsafe forces full speed regardless of the active curve. 
 frequency caps are staged behind a 15-second keep-or-revert dialog and are clamped to the
 hardware range; nothing GPU-side persists, so a reboot always restores stock clocks. Still,
 you are overriding firmware defaults — understand your hardware's limits.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

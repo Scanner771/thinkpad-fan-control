@@ -67,7 +67,7 @@ def _find_i915_dir():
 
 GPU_PATH = _find_i915_dir()
 
-VERSION = "2.1"
+VERSION = "2.2"
 APP_PATH = os.path.abspath(__file__)
 AUTOSTART_PATH = os.path.join(os.path.expanduser("~"), ".config", "autostart",
                               "fan-control.desktop")
